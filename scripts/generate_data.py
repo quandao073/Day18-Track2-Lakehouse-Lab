@@ -75,8 +75,67 @@ def _build_rows(n_rows: int) -> list[Row]:
 
 def main(n_rows: int = 1_000_000, out: str = "s3a://bronze/llm_calls_raw") -> None:
     spark = get_spark("generate_data")
-    rows = _build_rows(n_rows)
-    df = spark.createDataFrame(spark.sparkContext.parallelize(rows, numSlices=16))
+
+    N_PARTS = 16
+    chunk = n_rows // N_PARTS
+
+    # Fix: instead of building 1M rows in driver memory and serialising via
+    # py4j (which crashes the JVM), distribute generation to executors.
+    # Each executor receives only (offset, size) and runs the same Python
+    # logic as _build_rows() for its slice.  Driver memory stays tiny.
+    def _generate_slice(offset: int, size: int) -> list[Row]:
+        """Replicate _build_rows logic for a contiguous slice of rows."""
+        import json, random, uuid
+        from datetime import datetime, timedelta, timezone
+
+        random.seed(42 + offset)          # per-slice seed → deterministic
+        start = datetime(2026, 4, 1, tzinfo=timezone.utc)
+        span_seconds = DAYS_SPAN * 24 * 3600
+        seen_ids: list[str] = []
+        out_rows = []
+        for i in range(offset, offset + size):
+            ts = start + timedelta(seconds=int(i * span_seconds / n_rows))
+            model = random.choices(
+                ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-7"],
+                weights=[6, 3, 1],
+            )[0]
+            pt = random.randint(50, 4000)
+            ct = random.randint(20, 2000)
+            base, jitter = LATENCY_PROFILES[model]
+            latency_ms = max(50, int((base / 800.0) * ct + random.gauss(0, jitter)))
+            status = random.choices(["ok", "rate_limited", "error"], weights=[95, 3, 2])[0]
+
+            if seen_ids and random.random() < DUP_RATE:
+                rid = random.choice(seen_ids[-1024:])
+            else:
+                rid = str(uuid.uuid4())
+                seen_ids.append(rid)
+
+            out_rows.append(Row(
+                request_id=rid,
+                ts=ts,
+                raw_json=json.dumps({
+                    "model": model,
+                    "user_id": f"u_{random.randint(1, 5000)}",
+                    "usage": {"input": pt, "output": ct},
+                    "latency_ms": latency_ms,
+                    "status": status,
+                }),
+            ))
+        return out_rows
+
+    # Build list of (offset, size) — one per partition
+    slices = [(i * chunk, chunk) for i in range(N_PARTS)]
+    remainder = n_rows - N_PARTS * chunk
+    if remainder:
+        slices[-1] = (slices[-1][0], slices[-1][1] + remainder)
+
+    rdd = (
+        spark.sparkContext
+        .parallelize(slices, N_PARTS)
+        .flatMap(lambda s: _generate_slice(s[0], s[1]))
+    )
+    df = spark.createDataFrame(rdd)
     df.write.format("delta").mode("overwrite").save(out)
     n_unique = df.select("request_id").distinct().count()
     print(
